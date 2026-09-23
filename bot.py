@@ -7,23 +7,33 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import asyncpg
 
-# Конфигурация
+# Конфигурация из переменных окружения
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Предотвращение ошибок со ссылкой на PostgreSQL в Railway
+# Предотвращение ошибок со старым форматом ссылки PostgreSQL
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 router = Router()
 
 async def init_db(pool: asyncpg.Pool):
+    """Инициализация таблиц в базе данных PostgreSQL."""
     async with pool.acquire() as conn:
         await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, title TEXT, photo_id TEXT);
-            CREATE TABLE IF NOT EXISTS channels (channel_id TEXT PRIMARY KEY, url TEXT);
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS movies (
+                code TEXT PRIMARY KEY,
+                title TEXT,
+                photo_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT PRIMARY KEY,
+                url TEXT
+            );
         ''')
 
 # --- Хелперы для проверки подписки ---
@@ -42,6 +52,7 @@ async def check_subscription(bot: Bot, db_pool: asyncpg.Pool, user_id: int) -> b
             if member.status in ['left', 'kicked']:
                 return False
         except Exception:
+            # Если бот не является админом в канале или канал недоступен
             pass
     return True
 
@@ -57,17 +68,24 @@ async def get_sub_keyboard(db_pool: asyncpg.Pool) -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
-# --- Пользовательская часть (на узбекском) ---
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+# --- Пользовательская часть (на узбекском языке) ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot, db_pool: asyncpg.Pool):
+    # Фиксация пользователя в статистике
     async with db_pool.acquire() as conn:
         await conn.execute('INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING', message.from_user.id)
         movies_count = await conn.fetchval('SELECT COUNT(*) FROM movies')
 
+    # Если рекламные коды/фильмы ещё не добавлены
     if movies_count == 0:
         await message.answer("Assalomu aleykum, hozircha reklama beruvchilar yoq, agarda sizda kanal yoki botni reklama qilish kerak bolsa, admin @lixuauto")
         return
 
+    # Проверка обязательной подписки
     is_subbed = await check_subscription(bot, db_pool, message.from_user.id)
     if not is_subbed:
         kb = await get_sub_keyboard(db_pool)
@@ -105,24 +123,28 @@ async def handle_movie_request(message: Message, bot: Bot, db_pool: asyncpg.Pool
     else:
         await message.answer("Kechirasiz, bunday kod bilan film topilmadi.")
 
-# --- Админская часть (на русском) ---
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
 
+# --- Админская часть (на русском языке) ---
 @router.message(Command("addcode"))
 async def cmd_addcode(message: Message, command: CommandObject, db_pool: asyncpg.Pool):
     if not is_admin(message.from_user.id): return
     
     if not message.photo:
-        return await message.reply("Ошибка: Прикрепите фото к сообщению с командой!")
+        return await message.reply("Ошибка: Прикрепите фото к сообщению и укажите подпись с командой!")
         
     args = command.args
+    if not args and message.caption:
+        # Резервный парсинг аргументов из подписи
+        parts_cap = message.caption.split(maxsplit=2)
+        if len(parts_cap) >= 3:
+            args = f"{parts_cap[1]} {parts_cap[2]}"
+
     if not args:
-        return await message.reply("Использование: /addcode [3 цифры] [Название]")
+        return await message.reply("Использование: Прикрепите фото и напишите в подписи:\n/addcode [3 цифры] [Название]\n\nПример:\n/addcode 123 Матрица")
         
     parts = args.split(maxsplit=1)
     if len(parts) < 2:
-        return await message.reply("Укажите код и название. Пример: /addcode 123 Матрица")
+        return await message.reply("Укажите и код, и название!")
         
     code, title = parts
     if not code.isdigit() or len(code) != 3:
@@ -174,7 +196,7 @@ async def cmd_addch(message: Message, command: CommandObject, db_pool: asyncpg.P
             ON CONFLICT (channel_id) DO UPDATE SET url = EXCLUDED.url
         ''', channel_id, url)
         
-    await message.reply("✅ Канал добавлен для обязательной подписки. Бот должен быть администратором в этом канале!")
+    await message.reply("✅ Канал добавлен для обязательной подписки. Не забудьте сделать бота администратором в этом канале!")
 
 @router.message(Command("delch"))
 async def cmd_delch(message: Message, command: CommandObject, db_pool: asyncpg.Pool):
@@ -218,6 +240,8 @@ async def cmd_stats(message: Message, db_pool: asyncpg.Pool):
             
     await message.reply(f"📊 <b>Статистика бота:</b>\n\nПользователей: {users_count}\nДобавлено фильмов: {movies_count}", parse_mode="HTML")
 
+
+# --- Главный цикл запуска ---
 async def main():
     logging.basicConfig(level=logging.INFO)
     
@@ -229,19 +253,23 @@ async def main():
         logging.error("Не указан DATABASE_URL!")
         return
 
-    # Создаём пул подключений к БД
-    pool = await asyncpg.create_pool(dsn=DATABASE_URL)
-    await init_db(pool)
+    # Автоматическая обработка SSL под внутреннюю и публичную сеть Railway
+    try:
+        pool = await asyncpg.create_pool(dsn=DATABASE_URL, ssl=False)
+    except Exception as e:
+        logging.warning(f"Подключение с ssl=False не удалось ({e}), пробуем с ssl='require'...")
+        pool = await asyncpg.create_pool(dsn=DATABASE_URL, ssl="require")
 
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     
-    logging.info("Бот запущен...")
+    await init_db(pool)
+    logging.info("Бот успешно подключился к БД и готов к работе!")
+    
     await bot.delete_webhook(drop_pending_updates=True)
     
     try:
-        # Передаем db_pool во все хэндлеры через контекст aiogram
         await dp.start_polling(bot, db_pool=pool)
     finally:
         await pool.close()
